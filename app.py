@@ -436,20 +436,215 @@ def correlation_heatmap(data, columns, labels, title):
     show_chart(fig, 430)
 
 
-def make_globe(data, height=620):
-    """Interactive 3D Earth (drag to rotate, scroll to zoom) with severity markers."""
-    points = data.dropna(subset=["Latitude", "Longitude"]).copy()
-    points = points[
-        points["Latitude"].between(-90, 90) & points["Longitude"].between(-180, 180)
-    ]
+GLOBE_MODES = {
+    "all": "Every record, nothing skipped (WebGL)",
+    "latest": "Latest observation per location",
+    "worst": "Worst status in period per location",
+}
 
-    if not points.empty:
-        points = points.sort_values("Date", na_position="first").drop_duplicates(
-            subset=["City", "Country", "Latitude", "Longitude"], keep="last"
-        )
-        if len(points) > 6000:
-            points = points.sample(6000, random_state=7)
+
+def _prepare_places(data):
+    """Clean coordinates and give each recorded place one identity and one position.
+
+    Returns (points, place_coords, missing_places, total_rows, n_locations).
+    """
+    points = data.copy()
+    if "Severity" not in points.columns:
         points["Severity"] = classify_weather(points)
+
+    # Blank out impossible coordinates instead of dropping the whole row, so the
+    # city can still be placed from its other readings.
+    points.loc[~points["Latitude"].between(-90, 90), "Latitude"] = np.nan
+    points.loc[~points["Longitude"].between(-180, 180), "Longitude"] = np.nan
+
+    # One identity per recorded place. Rows without a city name are told apart by position.
+    unknown_city = points["City"].eq("Unknown")
+    place_id = points["City"].astype(str) + " | " + points["Country"].astype(str)
+    if unknown_city.any():
+        place_id = place_id.where(
+            ~unknown_city,
+            "Unknown @ " + points["Latitude"].round(2).astype(str) + "," + points["Longitude"].round(2).astype(str),
+        )
+    points["_place"] = place_id
+
+    # Every place gets its median coordinates from whichever of its rows have them.
+    place_coords = points.groupby("_place")[["Latitude", "Longitude"]].median()
+    missing_places = place_coords[place_coords["Latitude"].isna() | place_coords["Longitude"].isna()].index
+    return points, place_coords, missing_places, len(points), points["_place"].nunique()
+
+
+def _sphere_xyz(lat_deg, lon_deg, radius):
+    lat = np.radians(np.asarray(lat_deg, dtype=float))
+    lon = np.radians(np.asarray(lon_deg, dtype=float))
+    return (
+        radius * np.cos(lat) * np.cos(lon),
+        radius * np.cos(lat) * np.sin(lon),
+        radius * np.sin(lat),
+    )
+
+
+
+GEO_URLS = {
+    "coast": "https://cdn.jsdelivr.net/gh/nvkelso/natural-earth-vector@master/geojson/ne_110m_coastline.geojson",
+    "borders": "https://cdn.jsdelivr.net/gh/nvkelso/natural-earth-vector@master/geojson/ne_110m_admin_0_boundary_lines_land.geojson",
+}
+
+
+@st.cache_data(show_spinner="Loading world outlines...")
+def load_world_lines(kind: str):
+    """Download (once) coastline / border lines as lon,lat paths. Returns [] if offline."""
+    import json
+    import urllib.request
+
+    cache_file = PROJECT_DIR / f".geo_{kind}.json"
+    try:
+        if cache_file.exists():
+            return json.loads(cache_file.read_text())
+        with urllib.request.urlopen(GEO_URLS[kind], timeout=15) as resp:
+            gj = json.loads(resp.read().decode("utf-8"))
+        paths = []
+        for feat in gj["features"]:
+            geom = feat["geometry"]
+            lines = geom["coordinates"] if geom["type"] == "MultiLineString" else [geom["coordinates"]]
+            paths += [[(p[0], p[1]) for p in line] for line in lines]
+        cache_file.write_text(json.dumps(paths))
+        return paths
+    except Exception:
+        return []
+
+
+def _lines_trace(paths, radius, color, width, name):
+    xs, ys, zs = [], [], []
+    for path in paths:
+        arr = np.asarray(path, dtype=float)
+        x, y, z = _sphere_xyz(arr[:, 1], arr[:, 0], radius)
+        xs += list(np.round(x, 4)) + [None]
+        ys += list(np.round(y, 4)) + [None]
+        zs += list(np.round(z, 4)) + [None]
+    return go.Scatter3d(x=xs, y=ys, z=zs, mode="lines", line=dict(color=color, width=width),
+                        hoverinfo="skip", name=name, showlegend=False)
+
+
+def make_globe_webgl(data, levels=None, height=680):
+    """3D Earth that draws EVERY record as its own marker (WebGL, so 100k+ points stay smooth).
+
+    Each record is placed at its city's coordinates. Hover details come from a per-city layer,
+    because attaching text to every one of 100k+ points would make the page very heavy.
+    """
+    points, place_coords, missing_places, total_rows, n_locations = _prepare_places(data)
+    points = points.drop(columns=["Latitude", "Longitude"]).join(place_coords, on="_place")
+    points = points.dropna(subset=["Latitude", "Longitude"])
+    if levels:
+        points = points[points["Severity"].isin(levels)]
+
+    fig = go.Figure()
+
+    # Ocean sphere.
+    u = np.linspace(0, 2 * np.pi, 80)
+    v = np.linspace(0, np.pi, 40)
+    sx = np.outer(np.cos(u), np.sin(v))
+    sy = np.outer(np.sin(u), np.sin(v))
+    sz = np.outer(np.ones_like(u), np.cos(v))
+    fig.add_trace(go.Surface(
+        x=sx, y=sy, z=sz, surfacecolor=sz, cmin=-1, cmax=1, showscale=False, hoverinfo="skip",
+        colorscale=[[0, "#06182d"], [0.5, "#0a2a48"], [1, "#12456b"]],
+        lighting=dict(ambient=0.7, diffuse=0.6, specular=0.15, roughness=0.9), opacity=1.0,
+    ))
+
+    # Graticule every 30 degrees.
+    gx, gy, gz = [], [], []
+    for lat in range(-60, 61, 30):
+        lons = np.linspace(-180, 180, 120)
+        x, y, z = _sphere_xyz(np.full_like(lons, lat), lons, 1.001)
+        gx += list(x) + [None]; gy += list(y) + [None]; gz += list(z) + [None]
+    for lon in range(-180, 180, 30):
+        lats = np.linspace(-90, 90, 90)
+        x, y, z = _sphere_xyz(lats, np.full_like(lats, lon), 1.001)
+        gx += list(x) + [None]; gy += list(y) + [None]; gz += list(z) + [None]
+    fig.add_trace(go.Scatter3d(
+        x=gx, y=gy, z=gz, mode="lines", line=dict(color="#1f4468", width=1),
+        hoverinfo="skip", showlegend=False,
+    ))
+
+    # Continents and country borders (so the globe is recognisable).
+    coast = load_world_lines("coast")
+    if coast:
+        fig.add_trace(_lines_trace(coast, 1.002, "#7fc4ea", 2, "Coastlines"))
+    borders = load_world_lines("borders")
+    if borders:
+        fig.add_trace(_lines_trace(borders, 1.002, "#3f7ea6", 1, "Borders"))
+
+    counts = {level: 0 for level in SEVERITY_LEVELS}
+
+    # Layer 1: every record, no hover text (keeps the payload small).
+    for level in SEVERITY_LEVELS:
+        style = SEVERITY_STYLE[level]
+        subset = points[points["Severity"] == level]
+        counts[level] = len(subset)
+        if subset.empty:
+            continue
+        x, y, z = _sphere_xyz(subset["Latitude"], subset["Longitude"], 1.004)
+        fig.add_trace(go.Scatter3d(
+            x=np.round(x, 4), y=np.round(y, 4), z=np.round(z, 4), mode="markers",
+            name=f"{style['emoji']} {level} ({len(subset):,} records)", hoverinfo="skip",
+            marker=dict(size=2.2 if level == "Normal" else 3.0, color=style["color"], opacity=0.85),
+        ))
+
+    # Layer 2: one hoverable marker per city, showing its latest reading in the current selection.
+    if not points.empty:
+        latest = points.sort_values("Date", na_position="first").drop_duplicates("_place", keep="last")
+        x, y, z = _sphere_xyz(latest["Latitude"], latest["Longitude"], 1.006)
+        hover = (
+            "<b>" + latest["City"].astype(str) + "</b>, " + latest["Country"].astype(str)
+            + "<br>Latest status: " + latest["Severity"].astype(str)
+            + "<br>Records in selection: " + latest["_place"].map(points["_place"].value_counts()).astype(str)
+            + "<br>Condition: " + latest["Weather_Condition"].astype(str)
+            + "<br>Temperature: " + latest["Temperature_C"].round(1).astype(str) + " °C"
+        )
+        fig.add_trace(go.Scatter3d(
+            x=x, y=y, z=z, mode="markers", name="City details (hover)", showlegend=True,
+            text=hover.to_numpy(), hovertemplate="%{text}<extra></extra>",
+            marker=dict(size=4, color="rgba(255,255,255,0.0)", line=dict(width=0)),
+        ))
+
+    ex, ey, ez = _sphere_xyz(20, 78, 2.0)
+    fig.update_layout(
+        height=height,
+        paper_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=0, r=0, t=5, b=0),
+        font=dict(color="#dce7f3"),
+        scene=dict(
+            bgcolor="rgba(0,0,0,0)",
+            xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False),
+            aspectmode="cube",
+            camera=dict(eye=dict(x=float(ex), y=float(ey), z=float(ez))),
+        ),
+        legend=dict(x=0.01, y=0.99, bgcolor="rgba(11,23,40,0.75)", bordercolor=BORDER, borderwidth=1),
+    )
+    return fig, counts, total_rows, n_locations, sorted(str(p) for p in missing_places)
+
+
+def make_globe(data, mode="latest", levels=None, height=620):
+    """Interactive 3D Earth (drag to rotate, scroll to zoom) with severity markers.
+
+    mode: 'latest' = newest row per location, 'worst' = most severe row per location.
+    levels: severity levels to keep (applied after the per-location choice).
+    (For one marker per record, use make_globe_webgl.)
+    """
+    points, place_coords, missing_places, total_rows, n_locations = _prepare_places(data)
+
+    if mode == "worst":
+        points["_rank"] = points["Severity"].map({"Normal": 0, "Warning": 1, "Extreme": 2})
+        points = points.sort_values(["_rank", "Date"], na_position="first").drop(columns="_rank")
+    else:
+        points = points.sort_values("Date", na_position="first")
+    points = points.drop_duplicates(subset="_place", keep="last")
+    points = points.drop(columns=["Latitude", "Longitude"]).join(place_coords, on="_place")
+    points = points.dropna(subset=["Latitude", "Longitude"])
+
+    if levels:
+        points = points[points["Severity"].isin(levels)]
+    missing_cities = sorted(str(p) for p in missing_places)
 
     fig = go.Figure()
     counts = {level: 0 for level in SEVERITY_LEVELS}
@@ -504,7 +699,7 @@ def make_globe(data, height=620):
         ),
         dragmode="pan",
     )
-    return fig, counts
+    return fig, counts, total_rows, n_locations, missing_cities
 
 
 BOLD = re.compile(r"\*\*(.+?)\*\*")
@@ -600,16 +795,47 @@ if page == "Global Overview":
 
     section("🌐 Interactive 3D Earth Globe",
             "Drag to rotate, scroll to zoom, hover a marker for details. One marker per location (latest observation).")
-    shown_levels = st.multiselect(
-        "Show weather status", SEVERITY_LEVELS, default=SEVERITY_LEVELS,
-        format_func=lambda lvl: f"{SEVERITY_STYLE[lvl]['emoji']} {lvl}",
-    )
-    globe_data = working
-    if shown_levels and len(shown_levels) < len(SEVERITY_LEVELS):
-        globe_data = working[working["Severity"].isin(shown_levels)]
+    ctl_left, ctl_right = st.columns([3, 2])
+    with ctl_left:
+        shown_levels = st.multiselect(
+            "Show weather status", SEVERITY_LEVELS, default=SEVERITY_LEVELS,
+            format_func=lambda lvl: f"{SEVERITY_STYLE[lvl]['emoji']} {lvl}",
+        )
+    with ctl_right:
+        globe_mode = st.selectbox(
+            "Marker mode", list(GLOBE_MODES), format_func=lambda m: GLOBE_MODES[m],
+            help="'Latest' and 'Worst' draw one marker per city. 'Every observation' draws "
+                 "individual records, so repeated readings of one city overlap on the same spot.",
+        )
 
-    globe, level_counts = make_globe(globe_data)
+    with st.spinner("Drawing globe..."):
+        if globe_mode == "all":
+            globe, level_counts, globe_rows, globe_locations, missing_cities = make_globe_webgl(
+                working, levels=shown_levels or None
+            )
+        else:
+            globe, level_counts, globe_rows, globe_locations, missing_cities = make_globe(
+                working, mode=globe_mode, levels=shown_levels or None
+            )
     st.plotly_chart(globe, use_container_width=True, theme=None, config={"displaylogo": False})
+    drawn = sum(level_counts.values())
+    st.caption(
+        f"Your selection has **{globe_rows:,}** records covering **{globe_locations:,}** "
+        f"recorded places. Drawing **{drawn:,}** markers ({GLOBE_MODES[globe_mode].lower()})."
+    )
+    if globe_mode == "all" and globe_locations < drawn:
+        st.info(
+            f"All {drawn:,} records are drawn, but they come from only {globe_locations:,} places, "
+            "so readings from the same city sit on exactly the same spot and look like one dot. "
+            "That is accurate: the map cannot show more distinct positions than your data has."
+        )
+    if missing_cities:
+        st.warning(
+            f"{len(missing_cities):,} recorded place(s) have no valid latitude/longitude anywhere "
+            "in the data, so they cannot be placed on the globe."
+        )
+        with st.expander("Show places without coordinates"):
+            st.write(", ".join(missing_cities[:500]))
     kpi_row([
         ("🟢 Normal", f"{level_counts['Normal']:,}", "Locations", SEVERITY_COLORS["Normal"]),
         ("🟡 Warning", f"{level_counts['Warning']:,}", "Locations", SEVERITY_COLORS["Warning"]),
