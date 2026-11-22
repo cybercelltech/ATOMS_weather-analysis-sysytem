@@ -471,7 +471,7 @@ def correlation_heatmap(data, columns, labels, title):
 
 
 GLOBE_MODES = {
-    "all": "Every record, nothing skipped (WebGL)",
+    "all": "Every observation (one marker per record)",
     "latest": "Latest observation per location",
     "worst": "Worst status in period per location",
 }
@@ -518,33 +518,182 @@ def _sphere_xyz(lat_deg, lon_deg, radius):
 
 
 
+_NE = "https://cdn.jsdelivr.net/gh/nvkelso/natural-earth-vector@master/geojson/"
 GEO_URLS = {
-    "coast": "https://cdn.jsdelivr.net/gh/nvkelso/natural-earth-vector@master/geojson/ne_110m_coastline.geojson",
-    "borders": "https://cdn.jsdelivr.net/gh/nvkelso/natural-earth-vector@master/geojson/ne_110m_admin_0_boundary_lines_land.geojson",
+    "coast": [_NE + "ne_50m_coastline.geojson", _NE + "ne_110m_coastline.geojson"],
+    "borders": [_NE + "ne_50m_admin_0_boundary_lines_land.geojson",
+                _NE + "ne_110m_admin_0_boundary_lines_land.geojson"],
 }
+LAND_URLS = [_NE + "ne_50m_land.geojson", _NE + "ne_110m_land.geojson"]
 
 
-@st.cache_data(show_spinner="Loading world outlines...")
-def load_world_lines(kind: str):
-    """Download (once) coastline / border lines as lon,lat paths. Returns [] if offline."""
+def _download_json(urls):
+    """Return the first GeoJSON that downloads; raise with every failure if none does."""
     import json
     import urllib.request
 
-    cache_file = PROJECT_DIR / f".geo_{kind}.json"
+    problems = []
+    for url in urls:
+        try:
+            with urllib.request.urlopen(url, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as error:
+            problems.append(f"{url.split('/')[2]}: {error}")
+    raise RuntimeError(" | ".join(problems))
+
+
+@st.cache_data(show_spinner="Loading world outlines...")
+def _world_lines_cached(kind: str):
+    """Coastline / country-border lines as lon,lat paths. Raises when offline (so it is not cached)."""
+    import json
+
+    cache_file = PROJECT_DIR / f".geo_{kind}_v2.json"
+    if cache_file.exists():
+        try:
+            saved = json.loads(cache_file.read_text())
+            if saved:
+                return saved
+        except Exception:
+            pass
+    gj = _download_json(GEO_URLS[kind])
+    paths = []
+    for feat in gj["features"]:
+        for line in _geometry_lines(feat.get("geometry")):
+            pts = [(float(pt[0]), float(pt[1])) for pt in line]
+            if len(pts) >= 2:
+                paths.append(_decimate(pts, 0.05))
     try:
-        if cache_file.exists():
-            return json.loads(cache_file.read_text())
-        with urllib.request.urlopen(GEO_URLS[kind], timeout=15) as resp:
-            gj = json.loads(resp.read().decode("utf-8"))
-        paths = []
-        for feat in gj["features"]:
-            geom = feat["geometry"]
-            lines = geom["coordinates"] if geom["type"] == "MultiLineString" else [geom["coordinates"]]
-            paths += [[(p[0], p[1]) for p in line] for line in lines]
         cache_file.write_text(json.dumps(paths))
-        return paths
+    except Exception:
+        pass
+    return paths
+
+
+def load_world_lines(kind: str):
+    try:
+        return _world_lines_cached(kind)
     except Exception:
         return []
+
+
+@st.cache_data(show_spinner="Loading land outlines...")
+def _land_polygons():
+    """Land polygons (list of polygons, each a list of lon/lat rings). Raises when offline."""
+    import json
+
+    cache_file = PROJECT_DIR / ".geo_land_v2.json"
+    if cache_file.exists():
+        try:
+            saved = json.loads(cache_file.read_text())
+            if saved:
+                return saved
+        except Exception:
+            pass
+    gj = _download_json(LAND_URLS)
+    polygons = []
+    for feat in gj.get("features", []):
+        geom = feat.get("geometry") or {}
+        if geom.get("type") == "Polygon":
+            parts = [geom["coordinates"]]
+        elif geom.get("type") == "MultiPolygon":
+            parts = geom["coordinates"]
+        else:
+            continue
+        for part in parts:
+            polygons.append([[(float(pt[0]), float(pt[1])) for pt in ring] for ring in part])
+    if not polygons:
+        raise ValueError("no land polygons in the downloaded file")
+    try:
+        cache_file.write_text(json.dumps(polygons))
+    except Exception:
+        pass
+    return polygons
+
+
+def _land_mask(polygons, n_lat, n_lon, supersample=4):
+    """Rasterise land polygons to a (n_lat x n_lon) 0..1 mask, row 0 = south pole."""
+    from PIL import Image, ImageDraw
+
+    w, h = n_lon * supersample, n_lat * supersample
+    img = Image.new("L", (w, h), 0)
+    draw = ImageDraw.Draw(img)
+    sx, sy = (w - 1) / 360.0, (h - 1) / 180.0
+    for polygon in polygons:
+        for i, ring in enumerate(polygon):
+            pts = [((pt[0] + 180.0) * sx, (90.0 - pt[1]) * sy) for pt in ring]
+            if len(pts) >= 3:
+                draw.polygon(pts, fill=255 if i == 0 else 0)
+    img = img.resize((n_lon, n_lat), getattr(Image, "Resampling", Image).BOX)
+    return np.flipud(np.asarray(img, dtype=float) / 255.0)
+
+
+# Scalar 0..1 -> colour. 0-0.30 is ocean (deep navy -> turquoise shallows),
+# 0.31-1.0 is land (rainforest -> savanna -> desert -> taiga -> tundra -> ice).
+EARTH_COLORSCALE = [
+    [0.00, "#030d24"], [0.08, "#06214a"], [0.18, "#0b4a8a"], [0.26, "#1e90c8"], [0.30, "#47c9dc"],
+    [0.31, "#14532d"], [0.40, "#2f7d32"], [0.47, "#6fae45"], [0.55, "#c8b45a"], [0.62, "#c98f4d"],
+    [0.72, "#7d8f55"], [0.82, "#8a9a86"], [0.90, "#cfd9e3"], [1.00, "#ffffff"],
+]
+
+
+@st.cache_data(show_spinner="Building Earth surface...")
+def _build_surface(has_land: bool, step: float = 0.75):
+    lats = np.arange(-90.0, 90.0 + step / 2, step)
+    lons = np.arange(-180.0, 180.0 + step / 2, step)
+    lon_g, lat_g = np.meshgrid(lons, lats)
+    abs_lat = np.abs(lat_g)
+
+    if has_land:
+        from PIL import Image, ImageFilter
+
+        land = _land_mask(_land_polygons(), len(lats), len(lons))
+        shelf = np.asarray(
+            Image.fromarray(np.uint8(land * 255)).filter(ImageFilter.GaussianBlur(2.5)), dtype=float
+        ) / 255.0
+    else:
+        land = np.zeros_like(lat_g)
+        shelf = land
+    is_land = land > 0.5
+
+    ocean = 0.03 + 0.15 * np.cos(np.radians(lat_g)) ** 2 + 0.11 * np.clip(shelf * 1.6, 0, 1)
+    ocean = np.clip(ocean, 0.0, 0.29)
+    base = np.interp(
+        abs_lat, [0, 10, 20, 28, 36, 46, 56, 64, 70, 90],
+        [0.34, 0.45, 0.58, 0.62, 0.48, 0.46, 0.78, 0.88, 1.0, 1.0],
+    )
+    texture = 0.035 * np.sin(np.radians(lat_g) * 9) * np.cos(np.radians(lon_g) * 7)
+    land_val = np.clip(base + texture, 0.32, 1.0)
+    value = np.where(is_land, land_val, ocean)
+
+    x, y, z = _sphere_xyz(lat_g, lon_g, 1.0)
+    return {"x": np.round(x, 4), "y": np.round(y, 4), "z": np.round(z, 4), "c": np.round(value, 3)}
+
+
+def earth_surface():
+    """Return (surface_arrays, land_error). Falls back to a plain ocean ball when offline."""
+    try:
+        _land_polygons()
+        return _build_surface(True), None
+    except Exception as error:
+        return _build_surface(False), str(error)
+
+
+@st.cache_data
+def _space_dust(seed: int = 11):
+    """Stars and coloured nebula clouds placed in the cube around the globe."""
+    rng = np.random.default_rng(seed)
+    pts = rng.uniform(-1.5, 1.5, size=(4000, 3))
+    pts = pts[np.linalg.norm(pts, axis=1) > 1.15][:1200]
+    palette = np.array(["#ffffff", "#ffffff", "#cfe8ff", "#9fc5ff", "#fff1c1", "#ffd2a1", "#ffb3d9", "#c4b5fd"])
+    colors = palette[rng.integers(0, len(palette), len(pts))]
+    sizes = rng.choice([1.2, 1.6, 2.0, 2.6, 3.6], size=len(pts), p=[0.35, 0.3, 0.2, 0.1, 0.05])
+    nebulae = []
+    for color in ["#7c3aed", "#2563eb", "#db2777", "#0ea5e9", "#a855f7", "#14b8a6"]:
+        centre = rng.normal(size=3)
+        centre = centre / np.linalg.norm(centre) * rng.uniform(1.25, 1.4)
+        cloud = np.clip(centre + rng.normal(scale=0.22, size=(22, 3)), -1.48, 1.48)
+        nebulae.append((color, cloud[np.linalg.norm(cloud, axis=1) > 1.12]))
+    return {"stars": pts, "colors": colors, "sizes": sizes, "nebulae": nebulae}
 
 
 def _lines_trace(paths, radius, color, width, name):
@@ -683,13 +832,84 @@ def _geo_lines_trace(paths, color, width, name):
                          hoverinfo="skip", name=name, showlegend=False)
 
 
-def make_globe_webgl(data, levels=None, height=680, show_states=True):
-    """3D Earth that draws EVERY record as its own marker (WebGL, so 100k+ points stay smooth).
+WORLD_STATE_SOURCES = [
+    _NE + "ne_10m_admin_1_states_provinces_lines.geojson",
+    "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_10m_admin_1_states_provinces_lines.geojson",
+]
+WORLD_STATE_CACHE = PROJECT_DIR / ".geo_world_states_v1.json"
+COUNTRY_BORDER_COLOR = "#e2e8f0"
 
-    Each record is placed at its city's coordinates. Hover details come from a per-city layer,
-    because attaching text to every one of 100k+ points would make the page very heavy.
+
+@st.cache_data(show_spinner="Loading state / province borders for every country...")
+def _world_state_paths():
+    """Admin-1 (state / province) boundary lines of every country. Raises when nothing works."""
+    import json
+
+    if WORLD_STATE_CACHE.exists():
+        try:
+            saved = json.loads(WORLD_STATE_CACHE.read_text())
+            if saved.get("others"):
+                return saved
+        except Exception:
+            pass
+    gj = _download_json(WORLD_STATE_SOURCES)
+    others, india = [], []
+    for feature in gj.get("features", []):
+        bucket = india if _country_tag(feature.get("properties")) in ("ind", "india") else others
+        for line in _geometry_lines(feature.get("geometry")):
+            pts = [(float(pt[0]), float(pt[1])) for pt in line]
+            if len(pts) >= 2:
+                bucket.append(_decimate(pts, 0.05))
+    if not others:
+        raise ValueError("no state / province lines found in the downloaded file")
+    result = {"others": others, "india": india}
+    try:
+        WORLD_STATE_CACHE.write_text(json.dumps(result))
+    except Exception:
+        pass
+    return result
+
+
+def load_all_state_lines():
+    """Return (paths, error). India uses your india_states.geojson / its own source when available."""
+    india_paths, india_error = load_india_state_lines()
+    try:
+        world = _world_state_paths()
+        error = None
+    except Exception as exc:
+        world, error = {"others": [], "india": []}, str(exc)
+    paths = list(world["others"]) + list(india_paths or world["india"])
+    if not paths:
+        return [], error or india_error
+    return paths, error
+
+
+def _hover_text(subset):
+    return (
+        "<b>" + subset["City"].astype(str) + "</b>, " + subset["Country"].astype(str)
+        + "<br>Status: " + subset["Severity"].astype(str)
+        + "<br>Condition: " + subset["Weather_Condition"].astype(str)
+        + "<br>Temperature: " + subset["Temperature_C"].round(1).astype(str) + " °C"
+        + "<br>Wind: " + _col(subset, "Wind_Speed_kmh").round(1).astype(str) + " km/h"
+        + "<br>Rain: " + _col(subset, "Precipitation_mm").round(1).astype(str) + " mm"
+    )
+
+
+def make_globe(data, mode="latest", levels=None, height=720, show_states=True, focus=None):
+    """Interactive 3D Earth (drag to rotate, scroll to zoom) with severity markers.
+
+    mode: 'latest' = newest row per place, 'worst' = most severe row per place,
+          'all' = one marker for every record.
+    All three modes share the same globe, stars and borders.
     """
     points, place_coords, missing_places, total_rows, n_locations = _prepare_places(data)
+
+    if mode == "worst":
+        points["_rank"] = points["Severity"].map({"Normal": 0, "Warning": 1, "Extreme": 2})
+        points = points.sort_values(["_rank", "Date"], na_position="first").drop(columns="_rank")
+        points = points.drop_duplicates(subset="_place", keep="last")
+    elif mode == "latest":
+        points = points.sort_values("Date", na_position="first").drop_duplicates(subset="_place", keep="last")
     points = points.drop(columns=["Latitude", "Longitude"]).join(place_coords, on="_place")
     points = points.dropna(subset=["Latitude", "Longitude"])
     if levels:
@@ -697,19 +917,40 @@ def make_globe_webgl(data, levels=None, height=680, show_states=True):
 
     fig = go.Figure()
 
-    # Ocean sphere.
-    u = np.linspace(0, 2 * np.pi, 80)
-    v = np.linspace(0, np.pi, 40)
-    sx = np.outer(np.cos(u), np.sin(v))
-    sy = np.outer(np.sin(u), np.sin(v))
-    sz = np.outer(np.ones_like(u), np.cos(v))
-    fig.add_trace(go.Surface(
-        x=sx, y=sy, z=sz, surfacecolor=sz, cmin=-1, cmax=1, showscale=False, hoverinfo="skip",
-        colorscale=[[0, "#06182d"], [0.5, "#0a2a48"], [1, "#12456b"]],
-        lighting=dict(ambient=0.7, diffuse=0.6, specular=0.15, roughness=0.9), opacity=1.0,
+    # ---- space: stars + coloured nebula glow ----
+    dust = _space_dust()
+    for color, cloud in dust["nebulae"]:
+        if len(cloud):
+            fig.add_trace(go.Scatter3d(
+                x=cloud[:, 0], y=cloud[:, 1], z=cloud[:, 2], mode="markers", hoverinfo="skip",
+                showlegend=False, marker=dict(size=58, color=color, opacity=0.07, line=dict(width=0)),
+            ))
+    st_pts = dust["stars"]
+    fig.add_trace(go.Scatter3d(
+        x=st_pts[:, 0], y=st_pts[:, 1], z=st_pts[:, 2], mode="markers", hoverinfo="skip", showlegend=False,
+        marker=dict(size=dust["sizes"].tolist(), color=dust["colors"].tolist(), opacity=0.9, line=dict(width=0)),
     ))
 
-    # Graticule every 30 degrees.
+    # ---- Earth: ocean depth + land biomes + polar ice ----
+    surf, land_error = earth_surface()
+    st.session_state["_land_error"] = land_error
+    fig.add_trace(go.Surface(
+        x=surf["x"], y=surf["y"], z=surf["z"], surfacecolor=surf["c"], cmin=0, cmax=1,
+        colorscale=EARTH_COLORSCALE, showscale=False, hoverinfo="skip",
+        lighting=dict(ambient=0.62, diffuse=0.85, specular=0.28, roughness=0.55, fresnel=0.35),
+        lightposition=dict(x=6000, y=-3000, z=4000),
+    ))
+
+    # ---- thin glowing atmosphere ----
+    a_lat, a_lon = np.meshgrid(np.arange(-90, 91, 3.0), np.arange(-180, 181, 3.0), indexing="ij")
+    ax, ay, az = _sphere_xyz(a_lat, a_lon, 1.035)
+    fig.add_trace(go.Surface(
+        x=ax, y=ay, z=az, surfacecolor=np.zeros_like(ax), showscale=False, hoverinfo="skip",
+        colorscale=[[0, "#6cc4ff"], [1, "#6cc4ff"]], opacity=0.10,
+        lighting=dict(ambient=1.0, diffuse=0.0, specular=0.0),
+    ))
+
+    # ---- faint graticule ----
     gx, gy, gz = [], [], []
     for lat in range(-60, 61, 30):
         lons = np.linspace(-180, 180, 120)
@@ -720,42 +961,61 @@ def make_globe_webgl(data, levels=None, height=680, show_states=True):
         x, y, z = _sphere_xyz(lats, np.full_like(lats, lon), 1.001)
         gx += list(x) + [None]; gy += list(y) + [None]; gz += list(z) + [None]
     fig.add_trace(go.Scatter3d(
-        x=gx, y=gy, z=gz, mode="lines", line=dict(color="#1f4468", width=1),
+        x=gx, y=gy, z=gz, mode="lines", line=dict(color="rgba(150,210,255,0.25)", width=1),
         hoverinfo="skip", showlegend=False,
     ))
 
-    # Continents and country borders (so the globe is recognisable).
+    # ---- coastlines, country borders, state / province borders ----
     coast = load_world_lines("coast")
     if coast:
-        fig.add_trace(_lines_trace(coast, 1.002, "#7fc4ea", 2, "Coastlines"))
+        fig.add_trace(_lines_trace(coast, 1.002, "#bdf1ff", 2, "Coastlines"))
     borders = load_world_lines("borders")
     if borders:
-        fig.add_trace(_lines_trace(borders, 1.002, "#3f7ea6", 1, "Borders"))
+        fig.add_trace(_lines_trace(borders, 1.003, COUNTRY_BORDER_COLOR, 2, "Country borders"))
+    state_error = None
     if show_states:
-        state_paths, _ = load_india_state_lines()
+        state_paths, state_error = load_all_state_lines()
         if state_paths:
-            fig.add_trace(_lines_trace(state_paths, 1.003, STATE_BORDER_COLOR, 1, "Indian state borders"))
+            fig.add_trace(_lines_trace(state_paths, 1.0025, STATE_BORDER_COLOR, 1, "State / province borders"))
+    st.session_state["_state_error"] = state_error
 
+    # ---- severity markers ----
     counts = {level: 0 for level in SEVERITY_LEVELS}
+    px_size = {"Normal": 4, "Warning": 5.5, "Extreme": 7}
+    if mode == "all":
+        px_size = {"Normal": 2.2, "Warning": 3.0, "Extreme": 3.0}
 
-    # Layer 1: every record, no hover text (keeps the payload small).
     for level in SEVERITY_LEVELS:
         style = SEVERITY_STYLE[level]
         subset = points[points["Severity"] == level]
         counts[level] = len(subset)
         if subset.empty:
             continue
-        x, y, z = _sphere_xyz(subset["Latitude"], subset["Longitude"], 1.004)
-        fig.add_trace(go.Scatter3d(
-            x=np.round(x, 4), y=np.round(y, 4), z=np.round(z, 4), mode="markers",
-            name=f"{style['emoji']} {level} ({len(subset):,} records)", hoverinfo="skip",
-            marker=dict(size=2.2 if level == "Normal" else 3.0, color=style["color"], opacity=0.85),
-        ))
+        x, y, z = _sphere_xyz(subset["Latitude"], subset["Longitude"], 1.006)
+        x, y, z = np.round(x, 4), np.round(y, 4), np.round(z, 4)
+        if level != "Normal" and len(subset) <= 5000:  # soft glow ring behind alert markers
+            fig.add_trace(go.Scatter3d(
+                x=x, y=y, z=z, mode="markers", hoverinfo="skip", showlegend=False,
+                marker=dict(size=px_size[level] * 2.6, color=style["color"], opacity=0.22, line=dict(width=0)),
+            ))
+        marker = dict(size=px_size[level], color=style["color"], opacity=0.95)
+        if mode != "all":
+            marker["line"] = dict(width=1, color="rgba(255,255,255,0.65)")
+        trace = dict(
+            x=x, y=y, z=z, mode="markers", marker=marker,
+            name=f"{style['emoji']} {level} ({len(subset):,})",
+        )
+        if mode == "all":
+            trace["hoverinfo"] = "skip"
+        else:
+            trace["text"] = _hover_text(subset).to_numpy()
+            trace["hovertemplate"] = "%{text}<extra></extra>"
+        fig.add_trace(go.Scatter3d(**trace))
 
-    # Layer 2: one hoverable marker per city, showing its latest reading in the current selection.
-    if not points.empty:
+    # In 'all' mode hover details come from one invisible marker per city (keeps the page light).
+    if mode == "all" and not points.empty:
         latest = points.sort_values("Date", na_position="first").drop_duplicates("_place", keep="last")
-        x, y, z = _sphere_xyz(latest["Latitude"], latest["Longitude"], 1.006)
+        x, y, z = _sphere_xyz(latest["Latitude"], latest["Longitude"], 1.008)
         hover = (
             "<b>" + latest["City"].astype(str) + "</b>, " + latest["Country"].astype(str)
             + "<br>Latest status: " + latest["Severity"].astype(str)
@@ -766,18 +1026,25 @@ def make_globe_webgl(data, levels=None, height=680, show_states=True):
         fig.add_trace(go.Scatter3d(
             x=x, y=y, z=z, mode="markers", name="City details (hover)", showlegend=True,
             text=hover.to_numpy(), hovertemplate="%{text}<extra></extra>",
-            marker=dict(size=4, color="rgba(255,255,255,0.0)", line=dict(width=0)),
+            marker=dict(size=5, color="rgba(255,255,255,0.0)", line=dict(width=0)),
         ))
 
-    ex, ey, ez = _sphere_xyz(20, 78, 2.0)
+    if focus:
+        f_lat, f_lon, f_span = focus
+        dist = float(np.interp(f_span, [3, 30, 120, 200], [0.72, 0.95, 1.2, 1.45]))
+        ex, ey, ez = _sphere_xyz(f_lat, f_lon, dist)
+    else:
+        ex, ey, ez = _sphere_xyz(20, 78, 1.45)
+    space = "#02030b"
+    axis = dict(visible=False, range=[-1.5, 1.5])
     fig.update_layout(
         height=height,
-        paper_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor=space,
+        uirevision=str(focus),
         margin=dict(l=0, r=0, t=5, b=0),
         font=dict(color="#dce7f3"),
         scene=dict(
-            bgcolor="rgba(0,0,0,0)",
-            xaxis=dict(visible=False), yaxis=dict(visible=False), zaxis=dict(visible=False),
+            bgcolor=space, xaxis=axis, yaxis=dict(axis), zaxis=dict(axis),
             aspectmode="cube",
             camera=dict(eye=dict(x=float(ex), y=float(ey), z=float(ez))),
         ),
@@ -786,87 +1053,506 @@ def make_globe_webgl(data, levels=None, height=680, show_states=True):
     return fig, counts, total_rows, n_locations, sorted(str(p) for p in missing_places)
 
 
-def make_globe(data, mode="latest", levels=None, height=620, show_states=True):
-    """Interactive 3D Earth (drag to rotate, scroll to zoom) with severity markers.
+VIEW_MODES = {
+    "globe": "🌍 Globe",
+    "satellite": "🛰️ Satellite map",
+    "street": "🌙 Dark street map",
+}
+SATELLITE_TILES = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+LABEL_TILES = "https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}"
 
-    mode: 'latest' = newest row per location, 'worst' = most severe row per location.
-    levels: severity levels to keep (applied after the per-location choice).
-    (For one marker per record, use make_globe_webgl.)
-    """
+
+def _focus_view(data, choice):
+    """(lat, lon, span_degrees) centred on a country, or None for the whole world."""
+    if choice == "World":
+        return None
+    sub = data[data["Country"] == choice][["Latitude", "Longitude"]].apply(pd.to_numeric, errors="coerce").dropna()
+    sub = sub[sub["Latitude"].between(-90, 90) & sub["Longitude"].between(-180, 180)]
+    if sub.empty:
+        return None
+    lat_med = float(sub["Latitude"].median())
+    span = max(
+        float(sub["Latitude"].max() - sub["Latitude"].min()),
+        float(sub["Longitude"].max() - sub["Longitude"].min()) * float(np.cos(np.radians(lat_med))),
+        1.0,
+    )
+    return lat_med, float(sub["Longitude"].median()), span
+
+
+def _globe_points(data, mode, levels):
+    """Same point selection as make_globe, for the flat map views."""
     points, place_coords, missing_places, total_rows, n_locations = _prepare_places(data)
-
     if mode == "worst":
         points["_rank"] = points["Severity"].map({"Normal": 0, "Warning": 1, "Extreme": 2})
         points = points.sort_values(["_rank", "Date"], na_position="first").drop(columns="_rank")
-    else:
-        points = points.sort_values("Date", na_position="first")
-    points = points.drop_duplicates(subset="_place", keep="last")
+        points = points.drop_duplicates(subset="_place", keep="last")
+    elif mode == "latest":
+        points = points.sort_values("Date", na_position="first").drop_duplicates(subset="_place", keep="last")
     points = points.drop(columns=["Latitude", "Longitude"]).join(place_coords, on="_place")
     points = points.dropna(subset=["Latitude", "Longitude"])
-
     if levels:
         points = points[points["Severity"].isin(levels)]
-    missing_cities = sorted(str(p) for p in missing_places)
+    return points, total_rows, n_locations, sorted(str(p) for p in missing_places)
 
+
+def make_map(data, mode="latest", levels=None, height=720, basemap="satellite", focus=None, show_labels=False):
+    """Flat interactive map: scroll zooms toward the cursor, drag pans. Same markers as the globe."""
+    points, total_rows, n_locations, missing = _globe_points(data, mode, levels)
+    st.session_state["_state_error"] = None
+    st.session_state["_land_error"] = None
+
+    new_api = hasattr(go, "Scattermap")
+    Trace = go.Scattermap if new_api else go.Scattermapbox
     fig = go.Figure()
     counts = {level: 0 for level in SEVERITY_LEVELS}
+    sizes = {"Normal": 7, "Warning": 10, "Extreme": 13}
+    if mode == "all":
+        sizes = {"Normal": 5, "Warning": 7, "Extreme": 8}
 
-    if show_states:
-        state_paths, _ = load_india_state_lines()
-        if state_paths:
-            fig.add_trace(_geo_lines_trace(state_paths, STATE_BORDER_COLOR, 0.8, "Indian state borders"))
-
+    # Legend shows real record counts (same as the globe legend and the KPI cards),
+    # not just the number of markers drawn.
+    record_counts = data["Severity"].value_counts() if "Severity" in data.columns else None
     for level in SEVERITY_LEVELS:
         style = SEVERITY_STYLE[level]
-        subset = points[points["Severity"] == level] if not points.empty else points
+        subset = points[points["Severity"] == level]
         counts[level] = len(subset)
         if subset.empty:
             continue
+        n_records = int(record_counts.get(level, 0)) if record_counts is not None else len(subset)
+        label = f"{n_records:,} records"
+        if len(subset) != n_records:
+            label += f" · {len(subset):,} markers"
+        trace = dict(
+            lat=subset["Latitude"], lon=subset["Longitude"], mode="markers",
+            name=f"{style['emoji']} {level} ({label})",
+            marker=dict(size=sizes[level], color=style["color"], opacity=0.92),
+        )
+        if mode == "all":
+            trace["hoverinfo"] = "skip"
+        else:
+            trace.update(_hover_and_labels(subset, show_labels and (len(points) <= 800 or level != "Normal")))
+        fig.add_trace(Trace(**trace))
+
+    if mode == "all" and not points.empty:
+        latest = points.sort_values("Date", na_position="first").drop_duplicates("_place", keep="last")
         hover = (
-            "<b>" + subset["City"].astype(str) + "</b>, " + subset["Country"].astype(str)
-            + "<br>Status: " + style["emoji"] + " " + level
-            + "<br>Condition: " + subset["Weather_Condition"].astype(str)
-            + "<br>Temperature: " + subset["Temperature_C"].round(1).astype(str) + " °C"
-            + "<br>Wind: " + _col(subset, "Wind_Speed_kmh").round(1).astype(str) + " km/h"
-            + "<br>Rain: " + _col(subset, "Precipitation_mm").round(1).astype(str) + " mm"
+            "<b>" + latest["City"].astype(str) + "</b>, " + latest["Country"].astype(str)
+            + "<br>Latest status: " + latest["Severity"].astype(str)
+            + "<br>Records in selection: " + latest["_place"].map(points["_place"].value_counts()).astype(str)
+            + "<br>Condition: " + latest["Weather_Condition"].astype(str)
+            + "<br>Temperature: " + latest["Temperature_C"].round(1).astype(str) + " °C"
         )
-        fig.add_trace(
-            go.Scattergeo(
-                lon=subset["Longitude"], lat=subset["Latitude"], mode="markers",
-                name=f"{style['emoji']} {level} ({len(subset):,})",
-                text=hover.to_numpy(), hovertemplate="%{text}<extra></extra>",
-                marker=dict(
-                    size=style["size"], color=style["color"], opacity=0.92,
-                    line=dict(width=0.6, color=BG),
-                ),
+        city_trace = dict(
+            lat=latest["Latitude"], lon=latest["Longitude"], mode="markers", name="City details (hover)",
+            hovertext=hover.to_numpy(), hovertemplate="%{hovertext}<extra></extra>",
+            marker=dict(size=9, color="#ffffff", opacity=0.02),
+        )
+        if show_labels and len(latest) <= 800:
+            city_trace.update(
+                mode="markers+text", text=latest["City"].astype(str).to_numpy(),
+                textposition="top center", textfont=dict(size=10, color="#ffffff"),
             )
+        fig.add_trace(Trace(**city_trace))
+
+    if focus:
+        lat0, lon0, span = focus
+        zoom = float(np.clip(np.log2(360.0 / max(span, 0.5)) - 0.3, 1.0, 10.0))
+    else:
+        lat0, lon0, zoom = 20.0, 10.0, 1.2
+
+    cfg = dict(center=dict(lat=lat0, lon=lon0), zoom=zoom)
+    if basemap == "satellite":
+        cfg["style"] = "white-bg"
+        cfg["layers"] = [
+            dict(below="traces", sourcetype="raster", source=[SATELLITE_TILES],
+                 sourceattribution="Esri World Imagery"),
+            dict(below="traces", sourcetype="raster", source=[LABEL_TILES],
+                 sourceattribution="Esri Boundaries & Places"),
+        ]
+    else:
+        cfg["style"] = "carto-darkmatter"
+
+    fig.update_layout(
+        **{"map" if new_api else "mapbox": cfg},
+        height=height,
+        paper_bgcolor="#02030b",
+        margin=dict(l=0, r=0, t=5, b=0),
+        font=dict(color="#dce7f3"),
+        uirevision=f"{basemap}-{focus}",
+        legend=dict(x=0.01, y=0.99, bgcolor="rgba(11,23,40,0.75)", bordercolor=BORDER, borderwidth=1),
+    )
+    return fig, counts, total_rows, n_locations, missing
+
+
+def _hover_and_labels(subset, labels=False):
+    """Hover card for every marker, plus permanent city-name labels when asked."""
+    args = dict(hovertext=_hover_text(subset).to_numpy(), hovertemplate="%{hovertext}<extra></extra>")
+    if labels:
+        args.update(
+            mode="markers+text", text=subset["City"].astype(str).to_numpy(),
+            textposition="top center", textfont=dict(size=10, color="#ffffff"),
         )
+    return args
+
+
+@st.cache_data(show_spinner="Preparing state borders...")
+def _coarse_state_paths(tolerance: float = 0.35):
+    """State borders thinned for the rotating globe (keeps dragging smooth). Raises when incomplete."""
+    paths, error = load_all_state_lines()
+    if not paths or error:
+        raise RuntimeError(error or "no state borders available")
+    out = []
+    for path in paths:
+        pts = [(float(pt[0]), float(pt[1])) for pt in path]
+        if len(pts) >= 2:
+            out.append(_decimate(pts, tolerance))
+    return out
+
+
+def load_coarse_state_lines():
+    try:
+        return _coarse_state_paths(), None
+    except Exception as error:
+        return [], str(error)
+
+
+SPACE_KEY = "atmos_space"
+TEMP_SCALE = [[0.0, "#2b6cb0"], [0.2, "#38bdf8"], [0.4, "#4ade80"], [0.6, "#fbbf24"], [0.8, "#f97316"], [1.0, "#ef4444"]]
+
+
+def space_background_css():
+    """CSS starfield + coloured nebula glow behind the globe."""
+    import random
+
+    rnd = random.Random(5)
+    layers = [
+        "radial-gradient(ellipse at 14% 22%, rgba(124,58,237,0.38), transparent 42%)",
+        "radial-gradient(ellipse at 86% 18%, rgba(37,99,235,0.34), transparent 40%)",
+        "radial-gradient(ellipse at 78% 84%, rgba(219,39,119,0.30), transparent 42%)",
+        "radial-gradient(ellipse at 18% 88%, rgba(20,184,166,0.26), transparent 38%)",
+    ]
+    colors = ["#ffffff", "#ffffff", "#cfe8ff", "#fff1c1", "#ffd2a1", "#ffb3d9", "#c4b5fd"]
+    for _ in range(110):
+        x, y = rnd.uniform(0, 100), rnd.uniform(0, 100)
+        r = rnd.choice([0.7, 0.9, 1.1, 1.4, 1.9])
+        c = rnd.choice(colors)
+        layers.append(f"radial-gradient(circle at {x:.1f}% {y:.1f}%, {c} 0, {c} {r}px, transparent {r + 0.8}px)")
+    return (
+        f'<style>.st-key-{SPACE_KEY} div[data-testid="stPlotlyChart"] {{ '
+        f'background-color: #02030b !important; background-image: {", ".join(layers)} !important; }}</style>'
+    )
+
+
+def make_geo_globe(data, mode="latest", levels=None, height=720, show_states=True, focus=None,
+                   show_labels=False, color_countries=True):
+    """Rotating Earth globe: drag to rotate, scroll to zoom. It cannot be zoomed through, and every
+    marker shows its city card on hover (optionally permanent city-name labels)."""
+    points, total_rows, n_locations, missing = _globe_points(data, mode, levels)
+    st.session_state["_land_error"] = None
+    note = None
+    if mode == "all" and len(points) > 4000:
+        alerts = points[points["Severity"] != "Normal"].head(3000)
+        normal = points[points["Severity"] == "Normal"]
+        points = pd.concat([alerts, normal.sample(min(1000, len(normal)), random_state=7)])
+        note = ("The globe draws at most about 4,000 markers (all Warning / Extreme first plus a sample "
+                "of Normal) to stay smooth. Pick 'Latest' or 'Worst' mode, or a map view, for full detail.")
+    st.session_state["_globe_note"] = note
+    fig = go.Figure()
+
+    if color_countries:
+        by_country = known(data, "Country").dropna(subset=["Temperature_C"]).groupby("Country")["Temperature_C"].mean()
+        if len(by_country):
+            fig.add_trace(go.Choropleth(
+                locations=by_country.index.tolist(), locationmode="country names",
+                z=by_country.round(1).tolist(), zmin=-10, zmax=35, colorscale=TEMP_SCALE,
+                marker=dict(opacity=0.62, line=dict(width=0)),
+                colorbar=dict(title=dict(text="Avg °C", font=dict(size=11)), thickness=10, len=0.45,
+                              x=0.99, tickfont=dict(size=10)),
+                hovertemplate="%{location}<br>Average %{z} °C<extra></extra>", name="Country average",
+            ))
+
+    state_error = None
+    if show_states:
+        state_paths, state_error = load_coarse_state_lines()
+        if state_paths:
+            fig.add_trace(_geo_lines_trace(state_paths, STATE_BORDER_COLOR, 0.6, "State / province borders"))
+    st.session_state["_state_error"] = state_error
+
+    counts = {level: 0 for level in SEVERITY_LEVELS}
+    sizes = {"Normal": 6, "Warning": 8, "Extreme": 10}
+    if mode == "all":
+        sizes = {"Normal": 4, "Warning": 5, "Extreme": 6}
+    for level in SEVERITY_LEVELS:
+        style = SEVERITY_STYLE[level]
+        subset = points[points["Severity"] == level]
+        counts[level] = len(subset)
+        if subset.empty:
+            continue
+        trace = dict(
+            lon=subset["Longitude"], lat=subset["Latitude"], mode="markers",
+            name=f"{style['emoji']} {level} ({len(subset):,})",
+            marker=dict(size=sizes[level], color=style["color"], opacity=0.95,
+                        line=dict(width=0.8, color="rgba(255,255,255,0.85)")),
+        )
+        if mode == "all":
+            trace["hoverinfo"] = "skip"
+        else:
+            trace.update(_hover_and_labels(subset, show_labels and (len(points) <= 800 or level != "Normal")))
+        fig.add_trace(go.Scattergeo(**trace))
+
+    if mode == "all" and not points.empty:
+        latest = points.sort_values("Date", na_position="first").drop_duplicates("_place", keep="last")
+        hover = (
+            "<b>" + latest["City"].astype(str) + "</b>, " + latest["Country"].astype(str)
+            + "<br>Latest status: " + latest["Severity"].astype(str)
+            + "<br>Records in selection: " + latest["_place"].map(points["_place"].value_counts()).astype(str)
+            + "<br>Condition: " + latest["Weather_Condition"].astype(str)
+            + "<br>Temperature: " + latest["Temperature_C"].round(1).astype(str) + " °C"
+        )
+        city_trace = dict(
+            lon=latest["Longitude"], lat=latest["Latitude"], mode="markers", name="City details (hover)",
+            hovertext=hover.to_numpy(), hovertemplate="%{hovertext}<extra></extra>",
+            marker=dict(size=9, color="#ffffff", opacity=0.02),
+        )
+        if show_labels and len(latest) <= 800:
+            city_trace.update(
+                mode="markers+text", text=latest["City"].astype(str).to_numpy(),
+                textposition="top center", textfont=dict(size=10, color="#ffffff"),
+            )
+        fig.add_trace(go.Scattergeo(**city_trace))
+
+    if focus:
+        lat0, lon0, span = focus
+        scale = float(np.interp(span, [3, 30, 120, 200], [7.0, 3.0, 1.5, 1.0]))
+    else:
+        lat0, lon0, scale = 20.0, 78.0, 1.0
 
     fig.update_geos(
         projection_type="orthographic",
-        projection_rotation=dict(lon=78, lat=20, roll=0),
-        showocean=True, oceancolor="#0a2540",
-        showland=True, landcolor="#164563",
-        showcountries=True, countrycolor="#2f6285",
-        showcoastlines=True, coastlinecolor="#5b93b5",
-        showlakes=False, showframe=False,
-        lataxis=dict(showgrid=True, gridcolor="#1c3a57"),
-        lonaxis=dict(showgrid=True, gridcolor="#1c3a57"),
-        bgcolor="rgba(0,0,0,0)",
+        projection_rotation=dict(lon=lon0, lat=lat0, roll=0),
+        projection_scale=scale,
+        resolution=110,
+        showocean=True, oceancolor="#0b4f8f",
+        showland=True, landcolor="#3f9a52",
+        showlakes=True, lakecolor="#2aa8e0",
+        showcountries=True, countrycolor="#f1f5f9", countrywidth=0.8,
+        showcoastlines=True, coastlinecolor="#bdf1ff", coastlinewidth=1,
+        showframe=False, bgcolor="rgba(0,0,0,0)",
+        lataxis=dict(showgrid=True, gridcolor="rgba(150,210,255,0.20)", dtick=30),
+        lonaxis=dict(showgrid=True, gridcolor="rgba(150,210,255,0.20)", dtick=30),
     )
     fig.update_layout(
         height=height,
         paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
         margin=dict(l=0, r=0, t=5, b=0),
         font=dict(color="#dce7f3"),
-        legend=dict(
-            x=0.01, y=0.99, bgcolor="rgba(11,23,40,0.75)",
-            bordercolor=BORDER, borderwidth=1, itemsizing="constant",
-        ),
-        dragmode="pan",
+        uirevision=str(focus),
+        legend=dict(x=0.01, y=0.99, bgcolor="rgba(11,23,40,0.75)", bordercolor=BORDER, borderwidth=1,
+                    itemsizing="constant"),
     )
-    return fig, counts, total_rows, n_locations, missing_cities
+    return fig, counts, total_rows, n_locations, missing
+
+
+EARTH_TEXTURES = {
+    "Blue Marble (satellite)": "earth-blue-marble.jpg",
+    "Daytime map": "earth-day.jpg",
+    "Night lights": "earth-night.jpg",
+}
+GLOBE_HEIGHT = 720
+COUNTRY_LINES_URL = "https://raw.githubusercontent.com/vasturiano/globe.gl/master/example/datasets/ne_110m_admin_0_countries.geojson"
+
+GLOBE_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
+<style>
+html,body{margin:0;background:#02030b;overflow:hidden;font-family:Inter,Segoe UI,sans-serif}
+#g{width:100vw;height:__HEIGHT__px}
+#err{display:none;color:#fca5a5;padding:24px;font-size:14px}
+#legend{position:absolute;left:12px;top:12px;background:rgba(11,23,40,.78);border:1px solid #1d3550;
+border-radius:10px;padding:8px 12px;color:#dce7f3;font-size:12px;line-height:1.7}
+#legend i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px}
+</style>
+<script src="https://unpkg.com/globe.gl"></script></head><body>
+<div id="g"></div>
+<div id="legend">__LEGEND__</div>
+<div id="err">The globe library could not be loaded. This view needs an internet connection
+(it loads globe.gl and the Earth textures from unpkg.com).</div>
+<script>
+const D = __DATA__;
+const IMG = 'https://unpkg.com/three-globe/example/img/';
+if (typeof Globe === 'undefined') {
+  document.getElementById('err').style.display = 'block';
+  document.getElementById('legend').style.display = 'none';
+} else {
+  let K = 1;  // marker / label scale: shrinks as you zoom in so dots stay small next to states
+  const world = Globe({animateIn: false})(document.getElementById('g'))
+    .width(window.innerWidth).height(__HEIGHT__)
+    .globeImageUrl(IMG + D.texture)
+    .bumpImageUrl(IMG + 'earth-topology.png')
+    .backgroundImageUrl(IMG + 'night-sky.png')
+    .atmosphereColor('#7cc4ff').atmosphereAltitude(0.22)
+    .pointsData(D.points).pointLat('lat').pointLng('lng').pointColor('color')
+    .pointAltitude('alt').pointRadius(d => d.r * K).pointResolution(10).pointLabel('tip')
+    .labelsData(D.labels).labelLat('lat').labelLng('lng').labelText('text')
+    .labelSize(() => 0.4 * K).labelDotRadius(() => 0.08 * K).labelColor(() => 'rgba(255,255,255,0.95)')
+    .labelResolution(2).labelAltitude(0.012);
+  world.pointOfView({lat: D.pov.lat, lng: D.pov.lng, altitude: D.pov.alt}, 0);
+  const c = world.controls();
+  c.minDistance = 118; c.maxDistance = 600; c.zoomSpeed = 0.7; c.rotateSpeed = 0.7;
+  world.renderer().setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.25));
+  let lastK = -1;
+  const refreshSize = () => {
+    const alt = Math.max(world.camera().position.length() / 100 - 1, 0.05);
+    const k = Math.round(Math.min(Math.max(alt / 2.2, 0.4), 1.2) * 8) / 8;  // coarse steps: rebuild rarely
+    if (k === lastK) return;
+    lastK = k; K = k;
+    world.pointRadius(d => d.r * K);
+    world.labelSize(() => 0.4 * K).labelDotRadius(() => 0.08 * K);
+  };
+  c.addEventListener('change', refreshSize);
+  refreshSize();
+  window.addEventListener('resize', () => world.width(window.innerWidth));
+  // Borders are painted straight onto the Earth texture: one image instead of thousands of line objects.
+  const toPaths = g => {
+    const out = [];
+    g.features.forEach(f => {
+      const geom = f.geometry;
+      const polys = geom.type === 'Polygon' ? [geom.coordinates] : geom.coordinates;
+      polys.forEach(poly => poly.forEach(ring => out.push(ring.map(q => [q[1], q[0]]))));
+    });
+    return out;
+  };
+  fetch('__BORDERS__').then(r => r.json()).then(toPaths).catch(() => []).then(countryPaths => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      const maxT = world.renderer().capabilities.maxTextureSize || 4096;
+      const W = Math.min(6144, maxT), H = W / 2;
+      const cv = document.createElement('canvas');
+      cv.width = W; cv.height = H;
+      const g = cv.getContext('2d');
+      g.drawImage(img, 0, 0, W, H);
+      g.lineJoin = 'round';
+      const stroke = (paths, color, width) => {
+        g.strokeStyle = color; g.lineWidth = width; g.beginPath();
+        paths.forEach(pts => {
+          let prev = null;
+          pts.forEach(q => {
+            const x = (q[1] + 180) / 360 * W, y = (90 - q[0]) / 180 * H;
+            if (prev === null || Math.abs(q[1] - prev) > 180) g.moveTo(x, y); else g.lineTo(x, y);
+            prev = q[1];
+          });
+        });
+        g.stroke();
+      };
+      stroke(D.paths.map(p => p.pts), 'rgba(170,205,255,0.45)', 1.2);
+      stroke(countryPaths, 'rgba(235,242,255,0.62)', 1.8);
+      cv.toBlob(b => { if (b) world.globeImageUrl(URL.createObjectURL(b)); }, 'image/jpeg', 0.92);
+    };
+    img.src = IMG + D.texture;
+  });
+}
+</script></body></html>"""
+
+
+def make_webgl_globe(data, mode="latest", levels=None, height=GLOBE_HEIGHT, show_states=True, focus=None,
+                     show_labels=False, earth_style="Blue Marble (satellite)"):
+    """Realistic WebGL globe (globe.gl): satellite texture, terrain relief, atmosphere, starry sky.
+    Returns (html, counts, total_rows, n_locations, missing_places)."""
+    import html as html_lib
+    import json
+
+    points, total_rows, n_locations, missing = _globe_points(data, mode, levels)
+    st.session_state["_land_error"] = None
+
+    note = None
+    if mode == "all":
+        # Readings of one city share the same spot, so draw one dot per city (its worst status)
+        # instead of a pile of overlapping dots, and show how many records it stands for.
+        per_place = points["_place"].value_counts()
+        ranked = points.assign(_rank=points["Severity"].map({"Normal": 0, "Warning": 1, "Extreme": 2}))
+        points = ranked.sort_values(["_rank", "Date"], na_position="first").drop_duplicates("_place", keep="last")
+        points = points.drop(columns="_rank")
+        points["_n"] = points["_place"].map(per_place)
+        note = ("Records from the same city share one spot, so the globe draws one dot per city "
+                "(its worst status) and the hover card shows how many records it covers.")
+    if len(points) > 1200:
+        alerts = points[points["Severity"] != "Normal"].head(800)
+        normal = points[points["Severity"] == "Normal"]
+        points = pd.concat([alerts, normal.sample(min(400, len(normal)), random_state=7)])
+        note = ("The globe draws at most about 1,200 markers (all Warning / Extreme first plus a sample "
+                "of Normal) to stay smooth.")
+    st.session_state["_globe_note"] = note
+
+    def esc(value):
+        return html_lib.escape(str(value))
+
+    def fmt(value):
+        return "N/A" if value is None or pd.isna(value) else f"{value:.1f}"
+
+    alt = {"Normal": 0.001, "Warning": 0.001, "Extreme": 0.001}  # flat 2D dots
+    rad = {"Normal": 0.26, "Warning": 0.34, "Extreme": 0.42}
+    if mode == "all":
+        rad = {"Normal": 0.26, "Warning": 0.34, "Extreme": 0.42}
+
+    counts = {level: 0 for level in SEVERITY_LEVELS}
+    pts = []
+    for level in SEVERITY_LEVELS:
+        sub = points[points["Severity"] == level]
+        counts[level] = len(sub)
+        color = SEVERITY_STYLE[level]["color"]
+        n_rec = sub["_n"] if "_n" in sub.columns else pd.Series(np.nan, index=sub.index)
+        for lat, lon, city, country, cond, temp, wind, rain, when, n in zip(
+            sub["Latitude"], sub["Longitude"], sub["City"], sub["Country"], sub["Weather_Condition"],
+            sub["Temperature_C"], _col(sub, "Wind_Speed_kmh"), _col(sub, "Precipitation_mm"), sub["Date"], n_rec,
+        ):
+            seen = "" if pd.isna(when) else f"<br>Observed: {when:%d %b %Y %H:%M}"
+            if not pd.isna(n):
+                seen += f"<br>Records here: {int(n):,}"
+            tip = (
+                f"<div style='font:12px sans-serif;line-height:1.5'><b>{esc(city)}</b>, {esc(country)}"
+                f"<br>Status: <b style='color:{color}'>{level}</b><br>Condition: {esc(cond)}"
+                f"<br>Temperature: {fmt(temp)} °C<br>Wind: {fmt(wind)} km/h<br>Rain: {fmt(rain)} mm{seen}</div>"
+            )
+            pts.append({"lat": round(float(lat), 3), "lng": round(float(lon), 3), "color": color,
+                        "alt": alt[level], "r": rad[level], "tip": tip})
+
+    labels = []
+    if show_labels and not points.empty:
+        src = points if len(points) <= 300 else points[points["Severity"] != "Normal"]
+        src = src.drop_duplicates("_place").head(300)
+        labels = [
+            {"lat": round(float(la), 3), "lng": round(float(lo), 3), "text": str(city)}
+            for la, lo, city in zip(src["Latitude"], src["Longitude"], src["City"])
+        ]
+
+    paths, state_error = [], None
+    if show_states:
+        state_paths, state_error = load_coarse_state_lines()
+        paths = [
+            {"pts": [[round(la, 3), round(lo, 3)] for lo, la in path], "color": "rgba(251,191,36,0.8)"}
+            for path in state_paths
+        ]
+    st.session_state["_state_error"] = state_error
+
+    if focus:
+        f_lat, f_lon, span = focus
+        pov = {"lat": f_lat, "lng": f_lon, "alt": float(np.interp(span, [3, 30, 120, 200], [0.35, 0.8, 1.6, 2.4]))}
+    else:
+        pov = {"lat": 20, "lng": 78, "alt": 2.2}
+
+    records = data["Severity"].value_counts() if "Severity" in data.columns else counts
+    legend = "<b>Weather status (records)</b><br>" + "<br>".join(
+        f"<i style='background:{SEVERITY_STYLE[lv]['color']}'></i>{lv}: {int(records.get(lv, 0)):,}"
+        for lv in SEVERITY_LEVELS
+    ) + f"<br><span style='opacity:.65'>{sum(counts.values()):,} markers drawn</span>"
+    legend += "<br><span style='opacity:.65'>Hover a dot for city details</span>"
+    payload = {"points": pts, "labels": labels, "paths": paths, "pov": pov,
+               "texture": EARTH_TEXTURES.get(earth_style, "earth-blue-marble.jpg")}
+    data_json = json.dumps(payload, separators=(",", ":")).replace("</", "<\\/")
+    html_doc = (
+        GLOBE_HTML.replace("__HEIGHT__", str(int(height))).replace("__LEGEND__", legend)
+        .replace("__BORDERS__", COUNTRY_LINES_URL).replace("__DATA__", data_json)
+    )
+    return html_doc, counts, total_rows, n_locations, missing
 
 
 BOLD = re.compile(r"\*\*(.+?)\*\*")
@@ -961,7 +1647,7 @@ if page == "Global Overview":
     )
 
     section("🌐 Interactive 3D Earth Globe",
-            "Drag to rotate, scroll to zoom, hover a marker for details. One marker per location (latest observation).")
+            "Drag to rotate, scroll to zoom, hover a marker for details. Choose what each marker shows with 'Marker mode'.")
     ctl_left, ctl_right, ctl_extra = st.columns([3, 2, 1.4])
     with ctl_left:
         shown_levels = st.multiselect(
@@ -970,35 +1656,89 @@ if page == "Global Overview":
         )
     with ctl_right:
         globe_mode = st.selectbox(
-            "Marker mode", list(GLOBE_MODES), format_func=lambda m: GLOBE_MODES[m],
+            "Marker mode", list(GLOBE_MODES), index=1, format_func=lambda m: GLOBE_MODES[m],
             help="'Latest' and 'Worst' draw one marker per city. 'Every observation' draws "
                  "individual records, so repeated readings of one city overlap on the same spot.",
         )
     with ctl_extra:
         st.markdown("<div style='height:1.7rem'></div>", unsafe_allow_html=True)
         show_states = st.checkbox(
-            "Indian state borders", value=True,
-            help="Draws the borders between Indian states and union territories on the globe.",
+            "State borders (all countries)", value=True,
+            help="Draws state / province borders for every country on the globe.",
         )
 
-    with st.spinner("Drawing globe..."):
-        if globe_mode == "all":
-            globe, level_counts, globe_rows, globe_locations, missing_cities = make_globe_webgl(
-                working, levels=shown_levels or None, show_states=show_states
+    view_col, focus_col, opt_col = st.columns([3, 2, 2])
+    with view_col:
+        view_mode = st.radio(
+            "View mode", list(VIEW_MODES), horizontal=True, format_func=lambda v: VIEW_MODES[v],
+            help="Globe: rotate the whole Earth. Satellite / dark street map: flat maps that zoom "
+                 "in exactly where your cursor is.",
+        )
+    with focus_col:
+        focus_options = ["World"] + sorted(c for c in working["Country"].unique() if c != "Unknown")
+        focus_choice = st.selectbox(
+            "Zoom to country", focus_options,
+            help="Re-centres the view on this country (works in every view mode).",
+        )
+    with opt_col:
+        show_labels = st.checkbox(
+            "Show city names", value=False,
+            help="Writes each city's name next to its marker (when there are many cities, only "
+                 "Warning / Extreme ones are labelled). Hover any marker for the full details.",
+        )
+        earth_style = st.selectbox(
+            "Earth style (globe)", list(EARTH_TEXTURES),
+            help="Satellite photo, daytime map, or city lights at night.",
+        )
+    focus = _focus_view(working, focus_choice)
+
+    try:
+        holder = st.container(key=SPACE_KEY)
+    except TypeError:  # older Streamlit without keyed containers: plain dark background instead
+        holder = st.container()
+
+    with st.spinner("Drawing map..."):
+        if view_mode == "globe":
+            globe, level_counts, globe_rows, globe_locations, missing_cities = make_webgl_globe(
+                working, mode=globe_mode, levels=shown_levels or None, show_states=show_states,
+                focus=focus, show_labels=show_labels, earth_style=earth_style,
             )
         else:
-            globe, level_counts, globe_rows, globe_locations, missing_cities = make_globe(
-                working, mode=globe_mode, levels=shown_levels or None, show_states=show_states
+            globe, level_counts, globe_rows, globe_locations, missing_cities = make_map(
+                working, mode=globe_mode, levels=shown_levels or None, basemap=view_mode,
+                focus=focus, show_labels=show_labels,
             )
-    st.plotly_chart(globe, use_container_width=True, theme=None, config={"displaylogo": False})
-    if show_states:
-        _, state_error = load_india_state_lines()
-        if state_error:
-            st.warning(
-                "Indian state borders could not be loaded (the download failed). Save a GeoJSON of "
-                "India's states as `india_states.geojson` next to app.py and reload the page."
+    with holder:
+        if view_mode == "globe":
+            import streamlit.components.v1 as components
+
+            components.html(globe, height=GLOBE_HEIGHT)
+        else:
+            st.plotly_chart(
+                globe, use_container_width=True, theme=None,
+                key=f"globe_{view_mode}_{globe_mode}_{focus_choice}",
+                config={"displaylogo": False, "scrollZoom": True},
             )
-            st.caption(state_error)
+    if view_mode == "globe":
+        st.caption(
+            "Drag to spin the Earth, scroll to zoom (it stops before the surface). Hover a marker for "
+            "its city card. To zoom exactly to your cursor, use a map view or 'Zoom to country'."
+        )
+        if st.session_state.get("_globe_note"):
+            st.info(st.session_state["_globe_note"])
+    if view_mode == "globe" and show_states and st.session_state.get("_state_error"):
+        st.warning(
+            "State / province borders could not be fully loaded (the download failed). Check your "
+            "internet connection and reload the page. India's borders can also come from an "
+            "`india_states.geojson` file next to app.py."
+        )
+        st.caption(st.session_state["_state_error"])
+    if view_mode == "globe" and st.session_state.get("_land_error"):
+        st.warning(
+            "The land outlines could not be downloaded, so the Earth is drawn as plain ocean. "
+            "Reload the page once you are online."
+        )
+        st.caption(st.session_state["_land_error"])
     drawn = sum(level_counts.values())
     st.caption(
         f"Your selection has **{globe_rows:,}** records covering **{globe_locations:,}** "
@@ -1017,10 +1757,11 @@ if page == "Global Overview":
         )
         with st.expander("Show places without coordinates"):
             st.write(", ".join(missing_cities[:500]))
+    rec_counts = working["Severity"].value_counts()
     kpi_row([
-        ("🟢 Normal", f"{level_counts['Normal']:,}", "Locations", SEVERITY_COLORS["Normal"]),
-        ("🟡 Warning", f"{level_counts['Warning']:,}", "Locations", SEVERITY_COLORS["Warning"]),
-        ("🔴 Extreme", f"{level_counts['Extreme']:,}", "Locations", SEVERITY_COLORS["Extreme"]),
+        ("🟢 Normal", f"{int(rec_counts.get('Normal', 0)):,}", "Records in selection", SEVERITY_COLORS["Normal"]),
+        ("🟡 Warning", f"{int(rec_counts.get('Warning', 0)):,}", "Records in selection", SEVERITY_COLORS["Warning"]),
+        ("🔴 Extreme", f"{int(rec_counts.get('Extreme', 0)):,}", "Records in selection", SEVERITY_COLORS["Extreme"]),
     ])
     with st.expander("How statuses are decided"):
         st.markdown(
