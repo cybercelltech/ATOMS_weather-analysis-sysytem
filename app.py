@@ -1,6 +1,7 @@
 import gzip
 import re
 import warnings
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -83,15 +84,17 @@ st.markdown(
 PROJECT_DIR = Path(__file__).resolve().parent
 
 # -------------------------- FIND DATASET --------------------------
+# weather_data.csv comes first: if an older compressed_data*.csv.gz is still in the
+# folder it must not win over the CSV you are actually adding cities to.
 PREFERRED_DATASETS = [
-    PROJECT_DIR / "compressed_data (1).csv.gz",
-    PROJECT_DIR / "compressed_data.csv.gz",
     PROJECT_DIR / "weather_data.csv",
     PROJECT_DIR / "weather.csv",
-    PROJECT_DIR / "data" / "compressed_data (1).csv.gz",
-    PROJECT_DIR / "data" / "compressed_data.csv.gz",
     PROJECT_DIR / "data" / "weather_data.csv",
     PROJECT_DIR / "data" / "weather.csv",
+    PROJECT_DIR / "compressed_data (1).csv.gz",
+    PROJECT_DIR / "compressed_data.csv.gz",
+    PROJECT_DIR / "data" / "compressed_data (1).csv.gz",
+    PROJECT_DIR / "data" / "compressed_data.csv.gz",
 ]
 
 
@@ -144,8 +147,34 @@ AIR_ALIASES = {
 EXTRA_NUMERIC = ["pressure_mb", "cloud", "uv_index", "visibility_km", "feels_like_celsius", "gust_kph"]
 
 
+def parse_mixed_dates(values: pd.Series) -> pd.Series:
+    """Parse 'last_updated' when the file mixes formats.
+
+    Rows with a day above 12 look like '16-05-2024 14:15'; rows that were opened and
+    re-saved in Excel look like '1/6/2024 0:15'. Both are day-first. Parsing with one
+    inferred format silently turns every row of the other format into a blank date.
+    """
+    text = values.astype(str).str.strip()
+    parsed = pd.to_datetime(text, format="%d-%m-%Y %H:%M", errors="coerce")
+    for fmt in ("%d/%m/%Y %H:%M", "%Y-%m-%d %H:%M", "%d-%m-%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        missing = parsed.isna()
+        if not missing.any():
+            break
+        parsed[missing] = pd.to_datetime(text[missing], format=fmt, errors="coerce")
+    missing = parsed.isna()
+    if missing.any():
+        try:  # last resort for anything unusual (needs pandas >= 2.0)
+            parsed[missing] = pd.to_datetime(text[missing], format="mixed", dayfirst=True, errors="coerce")
+        except (TypeError, ValueError):
+            pass
+    return parsed
+
+
+# file_mtime_ns / file_size are not used inside the function. They are part of the cache
+# key on purpose, so editing weather_data.csv makes Streamlit reload it instead of
+# serving the copy it cached earlier (the cache used to be keyed on the path alone).
 @st.cache_data(show_spinner="Loading weather dataset...")
-def load_dataset(path_string: str) -> pd.DataFrame:
+def load_dataset(path_string: str, file_mtime_ns: int = 0, file_size: int = 0) -> pd.DataFrame:
     file_path = Path(path_string)
 
     if file_path.name.lower().endswith(".gz"):
@@ -184,7 +213,7 @@ def load_dataset(path_string: str) -> pd.DataFrame:
         if col in data.columns:
             data[col] = pd.to_numeric(data[col], errors="coerce")
 
-    data["Date"] = pd.to_datetime(data["Date"], errors="coerce")
+    data["Date"] = parse_mixed_dates(data["Date"])
 
     for col in ["Country", "City", "Weather_Condition"]:
         data[col] = data[col].fillna("Unknown").astype(str).str.strip()
@@ -199,7 +228,8 @@ if dataset_path is None:
     st.stop()
 
 try:
-    df = load_dataset(str(dataset_path))
+    _stat = dataset_path.stat()
+    df = load_dataset(str(dataset_path), _stat.st_mtime_ns, _stat.st_size)
 except Exception as error:
     st.error(f"Dataset loading failed: {error}")
     st.stop()
@@ -255,7 +285,11 @@ st.sidebar.markdown("# 🌍 ATMOS")
 st.sidebar.caption("WEATHER INTELLIGENCE PLATFORM")
 st.sidebar.markdown("---")
 st.sidebar.success(f"Dataset loaded: {dataset_path.name}")
-st.sidebar.caption(f"{len(df):,} records")
+_n_places = (df["City"] + " | " + df["Country"]).nunique()
+st.sidebar.caption(
+    f"{len(df):,} records · {_n_places:,} places · "
+    f"file saved {datetime.fromtimestamp(_stat.st_mtime):%d %b %Y, %H:%M}"
+)
 
 country_values = sorted(v for v in df["Country"].dropna().unique().tolist() if v != "Unknown")
 selected_countries = st.sidebar.multiselect(
@@ -525,7 +559,131 @@ def _lines_trace(paths, radius, color, width, name):
                         hoverinfo="skip", name=name, showlegend=False)
 
 
-def make_globe_webgl(data, levels=None, height=680):
+# --------------------------- INDIAN STATE BORDERS ---------------------------
+# Source order: india_states.geojson next to app.py (your own file wins) -> the copy
+# saved after the first successful download (.geo_india_states.json) -> the URLs below.
+# Boundaries are drawn exactly as the source file draws them, so a different file gives
+# a different depiction (for example of Jammu & Kashmir and Ladakh).
+LOCAL_STATE_FILE = PROJECT_DIR / "india_states.geojson"
+STATE_CACHE_FILE = PROJECT_DIR / ".geo_india_states.json"
+INDIA_STATE_SOURCES = [
+    "https://gist.githubusercontent.com/jbrobst/56c13bbbf9d97d187fea01ca62ea5112/raw/e388c4cae20aa53cb5090210a42ebb9b765c0a36/india_states.geojson",
+    "https://raw.githubusercontent.com/geohacker/india/master/state/india_state.geojson",
+    "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_10m_admin_1_states_provinces_lines.geojson",
+    "https://cdn.jsdelivr.net/gh/nvkelso/natural-earth-vector@master/geojson/ne_10m_admin_1_states_provinces_lines.geojson",
+]
+STATE_BORDER_COLOR = "#e0b050"
+_COUNTRY_KEYS = ("adm0_a3", "iso_a3", "sov_a3", "admin", "adm0_name", "country", "name_0")
+
+
+def _geometry_lines(geometry):
+    """Yield every line / polygon ring of a GeoJSON geometry as a list of [lon, lat, ...]."""
+    if not geometry:
+        return
+    kind, coords = geometry.get("type"), geometry.get("coordinates")
+    if kind == "LineString":
+        yield coords
+    elif kind in ("MultiLineString", "Polygon"):
+        yield from coords
+    elif kind == "MultiPolygon":
+        for polygon in coords:
+            yield from polygon
+    elif kind == "GeometryCollection":
+        for part in geometry.get("geometries", []):
+            yield from _geometry_lines(part)
+
+
+def _country_tag(properties):
+    """Return the lower-cased country label of a feature, or None if it has none."""
+    for key, value in (properties or {}).items():
+        if str(key).lower() in _COUNTRY_KEYS:
+            return str(value).strip().lower()
+    return None
+
+
+def _decimate(path, tolerance=0.02):
+    """Drop vertices within `tolerance` degrees of the last kept one (~2 km), keep both ends."""
+    kept = [path[0]]
+    for lon, lat in path[1:-1]:
+        if abs(lon - kept[-1][0]) + abs(lat - kept[-1][1]) >= tolerance:
+            kept.append((lon, lat))
+    kept.append(path[-1])
+    return kept
+
+
+def india_paths_from_geojson(geojson):
+    """Turn a states GeoJSON (polygons or lines) into [(lon, lat), ...] paths.
+
+    A world-wide file is reduced to India; an India-only file is used as it is.
+    """
+    features = geojson.get("features", [])
+    if any(_country_tag(f.get("properties")) is not None for f in features):
+        features = [f for f in features if _country_tag(f.get("properties")) in ("ind", "india")]
+    paths = []
+    for feature in features:
+        for line in _geometry_lines(feature.get("geometry")):
+            points = [(float(pt[0]), float(pt[1])) for pt in line]
+            if len(points) >= 2:
+                paths.append(_decimate(points))
+    if not paths:
+        raise ValueError("no Indian state outlines found in this file")
+    return paths
+
+
+@st.cache_data(show_spinner="Loading Indian state borders...")
+def _india_state_paths(local_stamp: float):
+    """Local file > saved copy > download. Raises when nothing works, so a failure is never cached."""
+    import json
+    import urllib.request
+
+    if LOCAL_STATE_FILE.exists():
+        return india_paths_from_geojson(json.loads(LOCAL_STATE_FILE.read_text(encoding="utf-8")))
+
+    if STATE_CACHE_FILE.exists():
+        try:
+            saved = json.loads(STATE_CACHE_FILE.read_text())
+            if saved:
+                return saved
+        except Exception:
+            pass
+
+    problems = []
+    for url in INDIA_STATE_SOURCES:
+        try:
+            with urllib.request.urlopen(url, timeout=30) as resp:
+                paths = india_paths_from_geojson(json.loads(resp.read().decode("utf-8")))
+        except Exception as error:
+            problems.append(f"{url.split('/')[2]}: {error}")
+            continue
+        try:
+            STATE_CACHE_FILE.write_text(json.dumps(paths))
+        except Exception:
+            pass
+        return paths
+    raise RuntimeError(" | ".join(problems))
+
+
+def load_india_state_lines():
+    """Return (paths, error_message). paths is [] when the borders could not be loaded."""
+    stamp = LOCAL_STATE_FILE.stat().st_mtime if LOCAL_STATE_FILE.exists() else 0.0
+    try:
+        return _india_state_paths(stamp), None
+    except Exception as error:
+        return [], str(error)
+
+
+def _geo_lines_trace(paths, color, width, name):
+    """Lon/lat line trace for the flat-projection Scattergeo globe."""
+    lons, lats = [], []
+    for path in paths:
+        arr = np.asarray(path, dtype=float)
+        lons += list(np.round(arr[:, 0], 3)) + [None]
+        lats += list(np.round(arr[:, 1], 3)) + [None]
+    return go.Scattergeo(lon=lons, lat=lats, mode="lines", line=dict(color=color, width=width),
+                         hoverinfo="skip", name=name, showlegend=False)
+
+
+def make_globe_webgl(data, levels=None, height=680, show_states=True):
     """3D Earth that draws EVERY record as its own marker (WebGL, so 100k+ points stay smooth).
 
     Each record is placed at its city's coordinates. Hover details come from a per-city layer,
@@ -573,6 +731,10 @@ def make_globe_webgl(data, levels=None, height=680):
     borders = load_world_lines("borders")
     if borders:
         fig.add_trace(_lines_trace(borders, 1.002, "#3f7ea6", 1, "Borders"))
+    if show_states:
+        state_paths, _ = load_india_state_lines()
+        if state_paths:
+            fig.add_trace(_lines_trace(state_paths, 1.003, STATE_BORDER_COLOR, 1, "Indian state borders"))
 
     counts = {level: 0 for level in SEVERITY_LEVELS}
 
@@ -624,7 +786,7 @@ def make_globe_webgl(data, levels=None, height=680):
     return fig, counts, total_rows, n_locations, sorted(str(p) for p in missing_places)
 
 
-def make_globe(data, mode="latest", levels=None, height=620):
+def make_globe(data, mode="latest", levels=None, height=620, show_states=True):
     """Interactive 3D Earth (drag to rotate, scroll to zoom) with severity markers.
 
     mode: 'latest' = newest row per location, 'worst' = most severe row per location.
@@ -648,6 +810,11 @@ def make_globe(data, mode="latest", levels=None, height=620):
 
     fig = go.Figure()
     counts = {level: 0 for level in SEVERITY_LEVELS}
+
+    if show_states:
+        state_paths, _ = load_india_state_lines()
+        if state_paths:
+            fig.add_trace(_geo_lines_trace(state_paths, STATE_BORDER_COLOR, 0.8, "Indian state borders"))
 
     for level in SEVERITY_LEVELS:
         style = SEVERITY_STYLE[level]
@@ -795,7 +962,7 @@ if page == "Global Overview":
 
     section("🌐 Interactive 3D Earth Globe",
             "Drag to rotate, scroll to zoom, hover a marker for details. One marker per location (latest observation).")
-    ctl_left, ctl_right = st.columns([3, 2])
+    ctl_left, ctl_right, ctl_extra = st.columns([3, 2, 1.4])
     with ctl_left:
         shown_levels = st.multiselect(
             "Show weather status", SEVERITY_LEVELS, default=SEVERITY_LEVELS,
@@ -807,17 +974,31 @@ if page == "Global Overview":
             help="'Latest' and 'Worst' draw one marker per city. 'Every observation' draws "
                  "individual records, so repeated readings of one city overlap on the same spot.",
         )
+    with ctl_extra:
+        st.markdown("<div style='height:1.7rem'></div>", unsafe_allow_html=True)
+        show_states = st.checkbox(
+            "Indian state borders", value=True,
+            help="Draws the borders between Indian states and union territories on the globe.",
+        )
 
     with st.spinner("Drawing globe..."):
         if globe_mode == "all":
             globe, level_counts, globe_rows, globe_locations, missing_cities = make_globe_webgl(
-                working, levels=shown_levels or None
+                working, levels=shown_levels or None, show_states=show_states
             )
         else:
             globe, level_counts, globe_rows, globe_locations, missing_cities = make_globe(
-                working, mode=globe_mode, levels=shown_levels or None
+                working, mode=globe_mode, levels=shown_levels or None, show_states=show_states
             )
     st.plotly_chart(globe, use_container_width=True, theme=None, config={"displaylogo": False})
+    if show_states:
+        _, state_error = load_india_state_lines()
+        if state_error:
+            st.warning(
+                "Indian state borders could not be loaded (the download failed). Save a GeoJSON of "
+                "India's states as `india_states.geojson` next to app.py and reload the page."
+            )
+            st.caption(state_error)
     drawn = sum(level_counts.values())
     st.caption(
         f"Your selection has **{globe_rows:,}** records covering **{globe_locations:,}** "
